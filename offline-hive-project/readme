@@ -1,0 +1,692 @@
+我们需要将data中的major.csv,school.csv和student.csv这三个文件都上传到hdfs上，路径自定义就行。
+这里，为了方便在Hive上建外接表，我分别存放到hdfs的/origin_data/amjor,/origin_data/school和/origin_data/student这三个目录下上,
+三个外接表都建在Hive的selecting_scshool的数据库下，作为ODS层，建表语句如下：
+-- 1. 专业表外部表 (ods_major)
+CREATE EXTERNAL TABLE IF NOT EXISTS ods_major (
+    major_id STRING COMMENT '专业ID',
+    major_name STRING COMMENT '专业名称',
+    school_name STRING COMMENT '学校名称',
+    major_rank INT COMMENT '专业排名'
+)
+COMMENT '专业原始数据表 - ODS层'
+ROW FORMAT DELIMITED
+FIELDS TERMINATED BY ','
+STORED AS TEXTFILE
+LOCATION '/origin_data/major'
+TBLPROPERTIES ('skip.header.line.count'='1');
+
+-- 2. 学校表外部表 (ods_school)
+CREATE EXTERNAL TABLE IF NOT EXISTS ods_school (
+    school_name STRING COMMENT '学校名称',
+    school_rank INT COMMENT '学校排名',
+    school_address STRING COMMENT '学校地址（省份）'
+)
+COMMENT '学校原始数据表 - ODS层'
+ROW FORMAT DELIMITED
+FIELDS TERMINATED BY ','
+STORED AS TEXTFILE
+LOCATION '/origin_data/school'
+TBLPROPERTIES ('skip.header.line.count'='1');
+
+-- 3. 学生表外部表 (ods_student)
+CREATE EXTERNAL TABLE IF NOT EXISTS ods_student (
+    student_id STRING COMMENT '学生ID',
+    major_id STRING COMMENT '专业ID',
+    student_school STRING COMMENT '学生所属学校',
+    student_education STRING COMMENT '学历（本科/硕士/博士）',
+    student_family_level STRING COMMENT '家庭水平',
+    student_income INT COMMENT '学生收入',
+    student_address STRING COMMENT '学生地址（省份）'
+)
+COMMENT '学生原始数据表 - ODS层'
+ROW FORMAT DELIMITED
+FIELDS TERMINATED BY ','
+STORED AS TEXTFILE
+LOCATION '/origin_data/student'
+TBLPROPERTIES ('skip.header.line.count'='1');
+
+建完外接表之后开始指标计算，十个指标分别为：学校排名top10，学生所在省份与学校所在省份比例，学生学历分布，所有专业学生平均收入top10，每个学校学生平均收入top10，
+学生选择什么专业的人数多top10，选择去哪上学数量top10，不同地区学校数量top10，学生选择学校更倾向于专业排名还是学校排名，不同家庭水平使学生选择专业倾向。
+
+指标表建表语句如下：
+-- 学校排名TOP10表
+CREATE TABLE IF NOT EXISTS dws_school_rank_top10 (
+    school_name VARCHAR(255) COMMENT '学校名称',
+    school_rank INT COMMENT '学校排名',
+    PRIMARY KEY (school_name) -- 以学校名称为主键，保证唯一性
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='学校排名TOP10';
+
+-- 同省份比例表
+CREATE TABLE IF NOT EXISTS dws_province_rate (
+    yes_or_no VARCHAR(10) COMMENT '是否同省份（yes/no）',
+    rate DOUBLE COMMENT '比例',
+    PRIMARY KEY (yes_or_no) -- 以yes/no为主键
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='同省份比例';
+
+-- 学生学历统计表
+CREATE TABLE IF NOT EXISTS dws_student_education_level (
+    student_education VARCHAR(20) COMMENT '学历（本科/硕士/博士）',
+    count INT COMMENT '人数',
+    PRIMARY KEY (student_education) -- 以学历为主键
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='学生学历统计';
+
+-- 专业收入TOP10表
+CREATE TABLE IF NOT EXISTS dws_major_income_top10 (
+    major_name VARCHAR(255) COMMENT '专业名称',
+    avg_income DOUBLE COMMENT '平均收入',
+    PRIMARY KEY (major_name) -- 以专业名称为主键
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='专业收入TOP10';
+
+-- 学校学生收入TOP10表
+CREATE TABLE IF NOT EXISTS dws_school_student_income_top10 (
+    school_name VARCHAR(255) COMMENT '学校名称',
+    avg_income DOUBLE COMMENT '学生平均收入',
+    PRIMARY KEY (school_name) -- 以学校名称为主键
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='学校学生收入TOP10';
+
+-- 专业选择人数表
+CREATE TABLE IF NOT EXISTS dws_major_number (
+    major_name VARCHAR(255) COMMENT '专业名称',
+    count INT COMMENT '选择人数',
+    PRIMARY KEY (major_name) -- 以专业名称为主键
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='专业选择人数';
+
+-- 省份选择人数表
+CREATE TABLE IF NOT EXISTS dws_province_number (
+    school_address VARCHAR(50) COMMENT '学校地址（省份）',
+    count INT COMMENT '选择人数',
+    PRIMARY KEY (school_address) -- 以省份为主键
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='省份选择人数';
+
+-- 省份学校数量表
+CREATE TABLE IF NOT EXISTS dws_school_address_number (
+    school_address VARCHAR(50) COMMENT '学校地址（省份）',
+    count INT COMMENT '学校数量',
+    PRIMARY KEY (school_address) -- 以省份为主键
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='省份学校数量';
+
+-- 专业/学校排名倾向表
+CREATE TABLE IF NOT EXISTS dws_major_or_school_rank_preference (
+    major_or_rank VARCHAR(20) COMMENT '倾向类型（major_rank/school_rank）',
+    preference_count INT COMMENT '统计数量',
+    PRIMARY KEY (major_or_rank) -- 以倾向类型为主键
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='专业/学校排名倾向';
+
+-- 家庭水平-专业偏好表
+CREATE TABLE IF NOT EXISTS dws_family_level_major_preference (
+    major_name VARCHAR(255) COMMENT '专业名称',
+    student_family_level VARCHAR(20) COMMENT '家庭水平（贫穷/一般/小康/富有）',
+    count INT COMMENT '选择人数',
+    PRIMARY KEY (major_name, student_family_level) -- 复合主键，保证专业+家庭水平的唯一性
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='家庭水平-专业偏好';
+
+指标计算语句分别为：
+
+ INSERT OVERWRITE TABLE dws_school_rank_top10
+ SELECT school_name,
+ CAST(TRIM(school_rank) AS INT) AS school_rank
+ FROM ods_school
+ ORDER BY school_rank ASC
+ LIMIT 10;
+
+ INSERT OVERWRITE TABLE dws_province_rate
+ SELECT
+ yes_or_no,
+ (count / total) AS rate
+ FROM (
+ SELECT
+ CASE
+ WHEN s.school_address = st.student_address THEN 'yes'
+ ELSE 'no'
+ END AS yes_or_no,
+ COUNT(*) AS count,
+ SUM(COUNT(*)) OVER() AS total
+ FROM ods_school s
+ JOIN ods_major m ON s.school_name = m.school_name
+ JOIN ods_student st ON m.major_id = st.major_id
+ GROUP BY CASE WHEN s.school_address = st.student_address THEN 'yes' ELSE 'no' END
+ ) t;
+
+ INSERT OVERWRITE TABLE dws_student_education_level
+ SELECT student_education, COUNT(*) AS count
+ FROM ods_student
+ GROUP BY student_education;
+
+ INSERT OVERWRITE TABLE dws_major_income_top10
+ SELECT m.major_name, AVG(st.student_income) AS avg_income
+ FROM ods_major m
+ JOIN ods_student st ON m.major_id = st.major_id
+ GROUP BY m.major_name
+ ORDER BY avg_income DESC
+ LIMIT 10;
+
+ INSERT OVERWRITE TABLE dws_school_student_income_top10
+ SELECT s.school_name, AVG(st.student_income) AS avg_income
+ FROM ods_school s
+ JOIN ods_major m ON s.school_name = m.school_name
+ JOIN ods_student st ON m.major_id = st.major_id
+ GROUP BY s.school_name
+ ORDER BY avg_income DESC
+ LIMIT 10;
+
+ INSERT OVERWRITE TABLE dws_major_number
+ SELECT m.major_name, COUNT(st.student_id) AS count
+ FROM ods_major m
+ JOIN ods_student st ON m.major_id = st.major_id
+ GROUP BY m.major_name
+ ORDER BY count DESC
+ LIMIT 10;
+
+ INSERT OVERWRITE TABLE dws_province_number
+ SELECT s.school_address, COUNT(st.student_id) AS count
+ FROM ods_school s
+ JOIN ods_major m ON s.school_name = m.school_name
+ JOIN ods_student st ON m.major_id = st.major_id
+ GROUP BY s.school_address
+ ORDER BY count DESC
+ LIMIT 10;
+
+ INSERT OVERWRITE TABLE dws_school_address_number
+ SELECT school_address, COUNT(school_name) AS count
+ FROM ods_school
+ GROUP BY school_address
+ ORDER BY count DESC
+ LIMIT 10;
+
+  INSERT OVERWRITE TABLE dws_major_or_school_rank_preference
+ SELECT
+ CASE
+ WHEN m.major_rank < s.school_rank THEN 'major_rank'  
+ ELSE 'school_rank'
+ END AS major_or_rank,
+ CAST(s.school_rank AS string) AS school_rank  
+ FROM ods_school s
+ JOIN ods_major m ON s.school_name = m.school_name
+ JOIN ods_student st ON m.major_id = st.major_id
+ GROUP BY CASE WHEN m.major_rank < s.school_rank THEN 'major_rank' ELSE 'school_rank' END, s.school_rank;
+
+ INSERT OVERWRITE TABLE dws_family_level_major_preference
+ SELECT m.major_name, st.student_family_level, COUNT(st.student_id) AS count
+ FROM ods_major m
+ JOIN ods_student st ON m.major_id = st.major_id
+ GROUP BY m.major_name, st.student_family_level
+ ORDER BY st.student_family_level, count DESC;
+
+现在指标计算完毕，然后使用DataX将数据同步到本地Mysql
+同步脚本分别如下：
+dws_school_rank_top10.json：
+{
+  "job": {
+    "setting": {
+      "speed": {
+        "channel": 1
+      }
+    },
+    "content": [
+      {
+        "reader": {
+          "name": "hdfsreader",
+          "parameter": {
+            "path": "/user/hive/warehouse/selecting_school.db/dws_school_rank_top10",
+            "defaultFS": "hdfs://hadoop102:8020",
+            "column": [
+              "*"
+            ],
+            "fileType": "text",
+            "encoding": "UTF-8",
+            "fieldDelimiter": ",",
+            "nullFormat": "\\N"
+          }
+        },
+        "writer": {
+          "name": "mysqlwriter",
+          "parameter": {
+            "writeMode": "replace",
+            "username": "root",
+            "password": "000000",
+            "column": [
+              "school_name",
+              "school_rank"
+            ],
+            "connection": [
+              {
+                "jdbcUrl": "jdbc:mysql://hadoop102:3306/selecting_school?useSSL=false&allowPublicKeyRetrieval=true&useUnicode=true&characterEncoding=utf-8",
+                "table": [
+                  "dws_school_rank_top10"
+                ]
+              }
+            ]
+          }
+        }
+      }
+    ]
+  }
+}
+
+dws_province_rate.json:
+{
+  "job": {
+    "setting": {
+      "speed": {
+        "channel": 1
+      }
+    },
+    "content": [
+      {
+        "reader": {
+          "name": "hdfsreader",
+          "parameter": {
+            "path": "/user/hive/warehouse/selecting_school.db/dws_province_rate",
+            "defaultFS": "hdfs://hadoop102:8020",
+            "column": [
+              "*"
+            ],
+            "fileType": "text",
+            "encoding": "UTF-8",
+            "fieldDelimiter": ",",
+            "nullFormat": "\\N"
+          }
+        },
+        "writer": {
+          "name": "mysqlwriter",
+          "parameter": {
+            "writeMode": "replace",
+            "username": "root",
+            "password": "000000",
+            "column": [
+              "yes_or_no",
+              "rate"
+            ],
+            "connection": [
+              {
+                "jdbcUrl": "jdbc:mysql://hadoop102:3306/selecting_school?useSSL=false&allowPublicKeyRetrieval=true&useUnicode=true&characterEncoding=utf-8",
+                "table": [
+                  "dws_province_rate"
+                ]
+              }
+            ]
+          }
+        }
+      }
+    ]
+  }
+}
+
+dws_student_education_level.json:
+{
+  "job": {
+    "setting": {
+      "speed": {
+        "channel": 1
+      }
+    },
+    "content": [
+      {
+        "reader": {
+          "name": "hdfsreader",
+          "parameter": {
+            "path": "/user/hive/warehouse/selecting_school.db/dws_student_education_level",
+            "defaultFS": "hdfs://hadoop102:8020",
+            "column": [
+              "*"
+            ],
+            "fileType": "text",
+            "encoding": "UTF-8",
+            "fieldDelimiter": ",",
+            "nullFormat": "\\N"
+          }
+        },
+        "writer": {
+          "name": "mysqlwriter",
+          "parameter": {
+            "writeMode": "replace",
+            "username": "root",
+            "password": "000000",
+            "column": [
+              "student_education",
+              "count"
+            ],
+            "connection": [
+              {
+                "jdbcUrl": "jdbc:mysql://hadoop102:3306/selecting_school?useSSL=false&allowPublicKeyRetrieval=true&useUnicode=true&characterEncoding=utf-8",
+                "table": [
+                  "dws_student_education_level"
+                ]
+              }
+            ]
+          }
+        }
+      }
+    ]
+  }
+}
+
+dws_major_income_top10.json:
+{
+  "job": {
+    "setting": {
+      "speed": {
+        "channel": 1
+      }
+    },
+    "content": [
+      {
+        "reader": {
+          "name": "hdfsreader",
+          "parameter": {
+            "path": "/user/hive/warehouse/selecting_school.db/dws_major_income_top10",
+            "defaultFS": "hdfs://hadoop102:8020",
+            "column": [
+              "*"
+            ],
+            "fileType": "text",
+            "encoding": "UTF-8",
+            "fieldDelimiter": ",",
+            "nullFormat": "\\N"
+          }
+        },
+        "writer": {
+          "name": "mysqlwriter",
+          "parameter": {
+            "writeMode": "replace",
+            "username": "root",
+            "password": "000000",
+            "column": [
+              "major_name",
+              "avg_income"
+            ],
+            "connection": [
+              {
+                "jdbcUrl": "jdbc:mysql://hadoop102:3306/selecting_school?useSSL=false&allowPublicKeyRetrieval=true&useUnicode=true&characterEncoding=utf-8",
+                "table": [
+                  "dws_major_income_top10"
+                ]
+              }
+            ]
+          }
+        }
+      }
+    ]
+  }
+}
+
+
+dws_school_student_income_top10.json:
+{
+  "job": {
+    "setting": {
+      "speed": {
+        "channel": 1
+      }
+    },
+    "content": [
+      {
+        "reader": {
+          "name": "hdfsreader",
+          "parameter": {
+            "path": "/user/hive/warehouse/selecting_school.db/dws_school_student_income_top10",
+            "defaultFS": "hdfs://hadoop102:8020",
+            "column": ["*"],
+            "fileType": "text",
+            "encoding": "UTF-8",
+            "fieldDelimiter": ",",
+            "nullFormat": "\\N"
+          }
+        },
+        "writer": {
+          "name": "mysqlwriter",
+          "parameter": {
+            "writeMode": "replace",
+            "username": "root",
+            "password": "000000",
+            "column": [ "school_name", "avg_income"],
+            "connection": [
+              {
+                "jdbcUrl": "jdbc:mysql://hadoop102:3306/selecting_school?useSSL=false&allowPublicKeyRetrieval=true&useUnicode=true&characterEncoding=utf-8",
+                "table": [
+                  "dws_school_student_income_top10"
+                ]
+              }
+            ]
+          }
+        }
+      }
+    ]
+  }
+}
+
+
+
+dws_major_number.json:
+{
+  "job": {
+    "setting": {
+      "speed": {
+        "channel": 1
+      }
+    },
+    "content": [
+      {
+        "reader": {
+          "name": "hdfsreader",
+          "parameter": {
+            "path": "/user/hive/warehouse/selecting_school.db/dws_major_number",
+            "defaultFS": "hdfs://hadoop102:8020",
+            "column": ["*"],
+            "fileType": "text",
+            "encoding": "UTF-8",
+            "fieldDelimiter": ",",
+            "nullFormat": "\\N"
+          }
+        },
+        "writer": {
+          "name": "mysqlwriter",
+          "parameter": {
+            "writeMode": "replace",
+            "username": "root",
+            "password": "000000",
+            "column": [ "major_name", "count"],
+            "connection": [
+              {
+                "jdbcUrl": "jdbc:mysql://hadoop102:3306/selecting_school?useSSL=false&allowPublicKeyRetrieval=true&useUnicode=true&characterEncoding=utf-8",
+                "table": [
+                  "dws_major_number"
+                ]
+              }
+            ]
+          }
+        }
+      }
+    ]
+  }
+}
+
+
+
+dws_province_number.json:
+{
+  "job": {
+    "setting": {
+      "speed": {
+        "channel": 1
+      }
+    },
+    "content": [
+      {
+        "reader": {
+          "name": "hdfsreader",
+          "parameter": {
+            "path": "/user/hive/warehouse/selecting_school.db/dws_province_number",
+            "defaultFS": "hdfs://hadoop102:8020",
+            "column": ["*"],
+            "fileType": "text",
+            "encoding": "UTF-8",
+            "fieldDelimiter": ",",
+            "nullFormat": "\\N"
+          }
+        },
+        "writer": {
+          "name": "mysqlwriter",
+          "parameter": {
+            "writeMode": "replace",
+            "username": "root",
+            "password": "000000",
+            "column": [ "school_address", "count"],
+            "connection": [
+              {
+                "jdbcUrl": "jdbc:mysql://hadoop102:3306/selecting_school?useSSL=false&allowPublicKeyRetrieval=true&useUnicode=true&characterEncoding=utf-8",
+                "table": [
+                  "dws_province_number"
+                ]
+              }
+            ]
+          }
+        }
+      }
+    ]
+  }
+}
+
+
+
+dws_school_address_number.json:
+{
+  "job": {
+    "setting": {
+      "speed": {
+        "channel": 1
+      }
+    },
+    "content": [
+      {
+        "reader": {
+          "name": "hdfsreader",
+          "parameter": {
+            "path": "/user/hive/warehouse/selecting_school.db/dws_school_address_number",
+            "defaultFS": "hdfs://hadoop102:8020",
+            "column": ["*"],
+            "fileType": "text",
+            "encoding": "UTF-8",
+            "fieldDelimiter": ",",
+            "nullFormat": "\\N"
+          }
+        },
+        "writer": {
+          "name": "mysqlwriter",
+          "parameter": {
+            "writeMode": "replace",
+            "username": "root",
+            "password": "000000",
+            "column": [ "school_address", "count"],
+            "connection": [
+              {
+                "jdbcUrl": "jdbc:mysql://hadoop102:3306/selecting_school?useSSL=false&allowPublicKeyRetrieval=true&useUnicode=true&characterEncoding=utf-8",
+                "table": [
+                  "dws_school_address_number"
+                ]
+              }
+            ]
+          }
+        }
+      }
+    ]
+  }
+}
+
+
+
+dws_major_or_school_rank_preference.json:
+{
+  "job": {
+    "setting": {
+      "speed": {
+        "channel": 1
+      }
+    },
+    "content": [
+      {
+        "reader": {
+          "name": "hdfsreader",
+          "parameter": {
+            "path": "/user/hive/warehouse/selecting_school.db/dws_major_or_school_rank_preference",
+            "defaultFS": "hdfs://hadoop102:8020",
+            "column": ["*"],
+            "fileType": "text",
+            "encoding": "UTF-8",
+            "fieldDelimiter": ",",
+            "nullFormat": "\\N"
+          }
+        },
+        "writer": {
+          "name": "mysqlwriter",
+          "parameter": {
+            "writeMode": "replace",
+            "username": "root",
+            "password": "000000",
+            "column": [ "major_or_rank", "preference_count"],
+            "connection": [
+              {
+                "jdbcUrl": "jdbc:mysql://hadoop102:3306/selecting_school?useSSL=false&allowPublicKeyRetrieval=true&useUnicode=true&characterEncoding=utf-8",
+                "table": [
+                  "dws_major_or_school_rank_preference"
+                ]
+              }
+            ]
+          }
+        }
+      }
+    ]
+  }
+}
+
+
+
+dws_family_level_major_preference.json.json:
+{
+  "job": {
+    "setting": {
+      "speed": {
+        "channel": 1
+      }
+    },
+    "content": [
+      {
+        "reader": {
+          "name": "hdfsreader",
+          "parameter": {
+            "path": "/user/hive/warehouse/selecting_school.db/dws_family_level_major_preference",
+            "defaultFS": "hdfs://hadoop102:8020",
+            "column": [ "*"],
+            "fileType": "text",
+            "encoding": "UTF-8",
+            "fieldDelimiter": ",",
+            "nullFormat": "\\N"
+          }
+        },
+        "writer": {
+          "name": "mysqlwriter",
+          "parameter": {
+            "writeMode": "replace",
+            "username": "root",
+            "password": "000000",
+            "column": [ "major_name", "student_family_level","count"],
+            "connection": [
+              {
+                "jdbcUrl": "jdbc:mysql://hadoop102:3306/selecting_school?useSSL=false&allowPublicKeyRetrieval=true&useUnicode=true&characterEncoding=utf-8",
+                "table": [
+                  "dws_family_level_major_preference"
+                ]
+              }
+            ]
+          }
+        }
+      }
+    ]
+  }
+}
+
+同步到本地mysql之后，SpringBoot与vue能直接拿到数据并渲染到前端，大家在使用时注意所有的数据库用户密码都用自己的。
+
+
+
+
